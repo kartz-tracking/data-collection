@@ -17,9 +17,10 @@ Then, in the project settings:
 
 - **Settings → Domains & Routes → Enable `workers.dev`.** A Worker has no public URL until
   you do; the Overview will say *No URLs enabled* until then.
-- **Settings → Variables and Secrets → `GEMINI_KEY`** — required. Everything runs through
-  Gemini, and the key lives here rather than in anyone's browser. Without it every run fails
-  with *Worker has no GEMINI_KEY secret set*.
+- **Settings → Variables and Secrets → `OLLAMA_API_KEY`** — required. Everything runs through
+  Ollama Cloud (`gemma4:31b`, thinking turned off), and the key lives here rather than in
+  anyone's browser. Create one at ollama.com → Settings → Keys. Without it every run fails
+  with *Worker has no OLLAMA_API_KEY secret set*.
 - `SHARED_PASS` — optional, and no longer entered anywhere on the page. The site is served
   from the Worker, so its own requests are recognised by origin and never need it; the phrase
   now only gates callers that are not the site — curl, a script, another origin.

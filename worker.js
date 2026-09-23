@@ -1,13 +1,14 @@
 /**
- * Kartz key holder — a Cloudflare Worker that keeps the Gemini key off the page.
+ * Kartz key holder — a Cloudflare Worker that keeps the Ollama Cloud key off the page.
  *
  * A static site cannot hold a secret. Anything index.html sends, a viewer can read out of
  * the network tab in about ten seconds, so obfuscating the key in JavaScript buys nothing.
  * The only real fix is for the key to live somewhere the browser never sees, and for the
  * browser to talk to that instead. This Worker is that somewhere.
  *
- * It is a thin pass-through: the page posts the ordinary Gemini request body to
- * POST /<model>, the Worker adds the key and forwards it to Google. The page's model
+ * The page posts the ordinary Gemini-shaped request body to POST /<model>. The Worker
+ * translates it into Ollama's /api/chat format, adds the key, sends it to Ollama Cloud and
+ * hands the answer back in the Gemini shape the page already parses. The page's model
  * fallback chain therefore keeps working unchanged.
  *
  * Normally this runs as part of the Cloudflare Pages deployment, mounted at /api by
@@ -17,7 +18,7 @@
  * It also stands alone as a plain Worker, for hosting the page somewhere else:
  *   1. npm i -g wrangler && wrangler login
  *   2. wrangler deploy
- *   3. wrangler secret put GEMINI_KEY     <- your key, at the prompt
+ *   3. wrangler secret put OLLAMA_API_KEY <- your key from ollama.com, at the prompt
  *   4. wrangler secret put SHARED_PASS    <- the phrase you give your officers
  *   5. Add the page's origin to ALLOWED_ORIGINS below, then deploy again.
  *
@@ -30,10 +31,67 @@
 const ALLOWED_ORIGINS = [
   'http://localhost:8731',
   'https://kartz-tracking.github.io',
-  'https://data-extractor.jk06nm04.workers.dev/api/gemini-3.5-flash-lite',
+  'https://data-collection.jk06nm04.workers.dev',
 ];
 
-const UPSTREAM = 'https://generativelanguage.googleapis.com/v1beta/models';
+const OLLAMA_URL = 'https://ollama.com/api/chat';
+
+// The rows the page expects back, enforced by Ollama's structured output rather than hoped for.
+// Every field is a string for the same reason as on the page: a model asked for a number will
+// sometimes answer "1,234" or "#4", and the page converts them itself.
+const ROW_SCHEMA = {
+  type: 'array',
+  items: {
+    type: 'object',
+    properties: {
+      rank:        { type: 'string' },
+      roster_name: { type: 'string' },
+      seen:        { type: 'string' },
+      points:      { type: 'string' },
+    },
+    required: ['rank', 'seen', 'points'],
+  },
+};
+
+// Ollama Cloud speaks its own /api/chat dialect. The page always sends the Gemini request
+// shape, so translate here in both directions, as runWorkersAI does below, rather than
+// teaching the page another dialect.
+async function runOllama(env, model, body) {
+  const parts = body?.contents?.[0]?.parts || [];
+  const text = parts.filter(p => p.text).map(p => p.text).join('\n');
+  const images = parts.filter(p => p.inline_data).map(p => p.inline_data.data);   // raw base64
+  const gc = body?.generationConfig || {};
+  const r = await fetch(OLLAMA_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + env.OLLAMA_API_KEY },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      // Gemma 4 thinks by default, and on a request this size the thinking can eat the whole
+      // output budget and minutes of time before a single row is written. Off.
+      think: false,
+      messages: [{ role: 'user', content: text, images }],
+      format: ROW_SCHEMA,
+      options: {
+        temperature: gc.temperature ?? 0,
+        seed: gc.seed ?? 7,
+        num_predict: gc.maxOutputTokens ?? 32768,
+      },
+    }),
+  });
+  if (!r.ok) {
+    const err = new Error(r.status + ': ' + (await r.text()).slice(0, 300));
+    err.status = r.status;
+    throw err;
+  }
+  const j = await r.json();
+  // hand it back in the shape the page already parses, token count included so the page's
+  // per-minute gate settles against what was really spent
+  return {
+    candidates: [{ content: { parts: [{ text: j.message?.content || '' }] } }],
+    usageMetadata: { totalTokenCount: (j.prompt_eval_count || 0) + (j.eval_count || 0) },
+  };
+}
 
 // Cloudflare's own models can be reached from inside a Worker through the AI binding.
 // They are deliberately NOT reachable from the page: the Workers AI REST API answers a
@@ -118,12 +176,13 @@ export default {
     const model = decodeURIComponent(
       new URL(request.url).pathname.replace(/^\/+/, '').replace(/^api\/+/, ''));
     const isCf = model.startsWith('@cf/');
-    if (!(isCf ? /^@cf\/[a-zA-Z0-9._\/\-]{1,80}$/ : /^[a-zA-Z0-9.\-]{1,64}$/).test(model))
+    // Ollama tags carry a colon (gemma4:31b), so it is allowed here.
+    if (!(isCf ? /^@cf\/[a-zA-Z0-9._\/\-]{1,80}$/ : /^[a-zA-Z0-9.:\-]{1,64}$/).test(model))
       return reply({ error: { code: 400, message: 'Bad model name.' } }, 400);
 
-    // Cloudflare's own models come from the binding, so no Google key is needed for those.
-    if (!isCf && !env.GEMINI_KEY)
-      return reply({ error: { code: 500, message: 'Worker has no GEMINI_KEY secret set.' } }, 500);
+    // Cloudflare's own models come from the binding, so no Ollama key is needed for those.
+    if (!isCf && !env.OLLAMA_API_KEY)
+      return reply({ error: { code: 500, message: 'Worker has no OLLAMA_API_KEY secret set.' } }, 500);
 
     // Frames are large; cap the body so a stray caller cannot post something enormous.
     const body = await request.text();
@@ -140,15 +199,13 @@ export default {
       }
     }
 
-    const upstream = await fetch(
-      `${UPSTREAM}/${model}:generateContent?key=${encodeURIComponent(env.GEMINI_KEY)}`,
-      { method: 'POST', headers: { 'content-type': 'application/json' }, body });
-
-    // Pass the status through untouched: the page relies on seeing 429 and 503 so it can
-    // move down its fallback chain.
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: { ...cors, 'content-type': upstream.headers.get('content-type') || 'application/json' },
-    });
+    try {
+      return reply(await runOllama(env, model, JSON.parse(body)), 200);
+    } catch (e) {
+      // Pass the upstream status through: the page relies on seeing 429 and 503 so it can
+      // wait or move down its fallback chain. Anything without one is a plain 502.
+      const status = e && e.status || 502;
+      return reply({ error: { code: status, message: String(e && e.message || e) } }, status);
+    }
   },
 };
