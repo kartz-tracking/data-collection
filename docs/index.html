@@ -157,19 +157,21 @@ details summary{cursor:pointer;font-size:13px;color:var(--muted)}
 <script>
 const $ = id => document.getElementById(id);
 // One configuration. The model call goes to /api on this same deployment, where the Worker
-// holds the Ollama key — nothing about the model or the credentials is exposed here, and
+// holds the keys — nothing about the model or the credentials is exposed here, and
 // there is nothing for anyone to configure or get wrong.
 // Shown on the page. Several people run this from their own phones and a browser can sit on
 // an open tab for days, so "it is still happening" and "it is fixed" are easy to say about
 // different builds. Bump it with any change worth telling apart from the one before.
-const BUILD = '2026-09-23d-ollama';
+const BUILD = '2026-09-23f';
 // Settings can be overridden from the address bar for side-by-side testing without a redeploy:
-//   …/?model=qwen3.5:cloud&frames=32&strips=2&parallel=2
+//   …/?model=gemma4:31b&frames=32&strips=2&parallel=2
+// A model name with a colon in it is an Ollama Cloud model; the Worker routes it there.
 // Leave them off and the defaults below apply.
 const QS = new URLSearchParams(location.search);
 const qsInt = (k, d, lo, hi) => { const n = parseInt(QS.get(k), 10);
                                   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
-const MODEL = QS.get('model') || 'gemma4:31b';     // Ollama Cloud, through the Worker
+const MODEL = QS.get('model') || 'gemini-3.5-flash-lite';
+const IS_OLLAMA = MODEL.includes(':');
 const FALLBACKS = [];        // one model, deliberately: a run either works or says why
 // This copy is served from GitHub Pages, not from the Worker, so its requests are
 // cross-origin and need the Worker's own address. On the workers.dev deployment of the same
@@ -196,13 +198,18 @@ const API_BASE = (location.hostname.endsWith('.workers.dev')
 // was a bad trade: 47 images to a request instead of 31 dropped the match rate from 91 of 129
 // to 67, for about 14,000 tokens. The model attends to a long batch worse than a short one,
 // and the tokens saved are not worth the reading lost.
-const REQ_CAP = 6, BATCH_MIN = 8, BATCH_MAX = 40;
+// ?requests=N overrides it for testing: the roster prompt rides along with every request, so
+// fewer requests means it is read fewer times — at the cost of longer batches.
+const REQ_CAP = qsInt('requests', 6, 1, 12), BATCH_MIN = 8, BATCH_MAX = 40;
+// ?sheet=0 leaves out the roster picture (the exotic names drawn as an image) for testing.
+if (QS.get('sheet') === '0') document.getElementById('sheetimg').checked = false;
 // How many batches may be at Ollama at the same moment. Ollama Cloud limits concurrent requests
 // per account by plan, and it does not always queue the extras: qwen3.5 answered every request
 // beyond the first with an immediate 429, and the retries then turned a run into a storm of
 // refusals. Sending only as many as the plan allows is quicker than being refused and waiting.
 // Raise it to match your plan's concurrency.
-const PARALLEL = qsInt('parallel', 1, 1, 16);
+// Gemini takes the whole run at once; Ollama's plan allows only one at a time by default.
+const PARALLEL = qsInt('parallel', IS_OLLAMA ? 1 : 16, 1, 16);
 const batchSize = n => Math.min(BATCH_MAX, Math.max(BATCH_MIN, Math.ceil(n / REQ_CAP)));
 
 /* ---------------- persistence ---------------- */
@@ -1470,7 +1477,9 @@ $('go').onclick = async () => {
     const t2 = performance.now();
     // Where the time went, so a slow run can be pinned on the phone or on the model.
     const timing = `sampling ${((t1 - t0) / 1000).toFixed(1)}s, model ${((t2 - t1) / 1000).toFixed(1)}s`
-      + ` — ${MODEL}, ${FRAMES} frames × ${STRIPS} strips, ${PARALLEL} at a time`;
+      + ` — ${MODEL}, ${FRAMES} frames × ${STRIPS} strips, `
+      + `${Math.ceil(frames.length / batchSize(frames.length))} requests, ${PARALLEL} at a time`
+      + ($('sheetimg').checked ? '' : ', no roster picture');
     console.log('[kartz] ' + timing);
     const frameCount = frames.length;
     // A roster_name the model returned is only worth anything if it is genuinely in the
@@ -1581,9 +1590,12 @@ $('go').onclick = async () => {
   } catch (e) {
     const m = e.message;
     log(/\b429\b/.test(m) && /quota|per day/i.test(m)
-      ? '✗ Ollama Cloud usage limit reached. Each run costs '
-        + Math.ceil(FRAMES * STRIPS / batchSize(FRAMES * STRIPS)) + ' requests. Wait for the limit to reset, '
-        + 'or check the plan on your ollama.com account.'
+      ? (IS_OLLAMA
+          ? '✗ Ollama Cloud usage limit reached. Wait for the limit to reset, '
+            + 'or check the plan on your ollama.com account.'
+          : '✗ Daily free-tier quota used up (Gemini allows 500 requests a day). Each run costs '
+            + Math.ceil(FRAMES * STRIPS / batchSize(FRAMES * STRIPS)) + ' of them. Wait for the reset, '
+            + 'or enable billing on the key.')
       : '✗ ' + m);
   }
   $('go').disabled = false;
