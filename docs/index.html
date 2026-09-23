@@ -188,6 +188,7 @@ const API_BASE = location.hostname.endsWith('.workers.dev')
 // to 67, for about 14,000 tokens. The model attends to a long batch worse than a short one,
 // and the tokens saved are not worth the reading lost.
 const REQ_CAP = 6, BATCH_MIN = 8, BATCH_MAX = 40;
+const PARALLEL = 1;
 const batchSize = n => Math.min(BATCH_MAX, Math.max(BATCH_MIN, Math.ceil(n / REQ_CAP)));
 
 /* ---------------- persistence ---------------- */
