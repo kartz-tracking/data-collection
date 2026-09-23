@@ -157,29 +157,18 @@ details summary{cursor:pointer;font-size:13px;color:var(--muted)}
 <script>
 const $ = id => document.getElementById(id);
 // One configuration. The model call goes to /api on this same deployment, where the Worker
-// holds the keys — nothing about the model or the credentials is exposed here, and
+// holds the Google key — nothing about the model or the credentials is exposed here, and
 // there is nothing for anyone to configure or get wrong.
 // Shown on the page. Several people run this from their own phones and a browser can sit on
 // an open tab for days, so "it is still happening" and "it is fixed" are easy to say about
 // different builds. Bump it with any change worth telling apart from the one before.
-const BUILD = '2026-09-23f';
-// Settings can be overridden from the address bar for side-by-side testing without a redeploy:
-//   …/?model=gemma4:31b&frames=32&strips=2&parallel=2
-// A model name with a colon in it is an Ollama Cloud model; the Worker routes it there.
-// Leave them off and the defaults below apply.
-const QS = new URLSearchParams(location.search);
-const qsInt = (k, d, lo, hi) => { const n = parseInt(QS.get(k), 10);
-                                  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
-const MODEL = QS.get('model') || 'gemini-3.5-flash-lite';
-const IS_OLLAMA = MODEL.includes(':');
+const BUILD = '2026-08-28c-gh';
+const MODEL = 'gemini-3.5-flash-lite';
 const FALLBACKS = [];        // one model, deliberately: a run either works or says why
 // This copy is served from GitHub Pages, not from the Worker, so its requests are
 // cross-origin and need the Worker's own address. On the workers.dev deployment of the same
 // file the page and the API share an origin and the relative path is right.
-// Running under `wrangler dev` on this machine is the same arrangement, just local: the page
-// and the API come from one origin, so the local Worker is the one that answers.
-const API_BASE = (location.hostname.endsWith('.workers.dev')
-                  || /^(localhost|127\.0\.0\.1)$/.test(location.hostname))
+const API_BASE = location.hostname.endsWith('.workers.dev')
   ? '/api'
   : 'https://data-collection.jk06nm04.workers.dev/api';
 // The allowance is fifteen REQUESTS a minute and it does not care what they carry: sixteen
@@ -198,18 +187,7 @@ const API_BASE = (location.hostname.endsWith('.workers.dev')
 // was a bad trade: 47 images to a request instead of 31 dropped the match rate from 91 of 129
 // to 67, for about 14,000 tokens. The model attends to a long batch worse than a short one,
 // and the tokens saved are not worth the reading lost.
-// ?requests=N overrides it for testing: the roster prompt rides along with every request, so
-// fewer requests means it is read fewer times — at the cost of longer batches.
-const REQ_CAP = qsInt('requests', 6, 1, 12), BATCH_MIN = 8, BATCH_MAX = 40;
-// ?sheet=0 leaves out the roster picture (the exotic names drawn as an image) for testing.
-if (QS.get('sheet') === '0') document.getElementById('sheetimg').checked = false;
-// How many batches may be at Ollama at the same moment. Ollama Cloud limits concurrent requests
-// per account by plan, and it does not always queue the extras: qwen3.5 answered every request
-// beyond the first with an immediate 429, and the retries then turned a run into a storm of
-// refusals. Sending only as many as the plan allows is quicker than being refused and waiting.
-// Raise it to match your plan's concurrency.
-// Gemini takes the whole run at once; Ollama's plan allows only one at a time by default.
-const PARALLEL = qsInt('parallel', IS_OLLAMA ? 1 : 16, 1, 16);
+const REQ_CAP = 6, BATCH_MIN = 8, BATCH_MAX = 40;
 const batchSize = n => Math.min(BATCH_MAX, Math.max(BATCH_MIN, Math.ceil(n / REQ_CAP)));
 
 /* ---------------- persistence ---------------- */
@@ -855,10 +833,7 @@ const SHARP_MAX = 0.2, SHARP_STEPS = 3;
 // bands are free, and because each one now spans about three rows instead of 2.3, every rank
 // turns up in more of them. That matters more than the seams: 56 of 153 ranks were being seen
 // exactly once in a run, with no second reading to fall back on if the first went wrong.
-const STRIPS = qsInt('strips', 3, 1, 4), STRIP_OVERLAP = 0.25;
-// Frames sampled from the recording; each is cut into STRIPS images. 64 was sized for Gemini's
-// per-minute token allowance, not for accuracy, so it is worth testing lower on Ollama.
-const FRAMES = qsInt('frames', +(document.getElementById('sens') || {}).value || 64, 8, 128);
+const STRIPS = 3, STRIP_OVERLAP = 0.25;
 function sliceStrips(src) {
   const w = src.width, h = src.height;
   const band = h / STRIPS, pad = band * STRIP_OVERLAP;
@@ -1198,14 +1173,7 @@ async function callModel(frames) {
         + (switched.size ? `  (fell back to ${[...switched].join(', ')})` : ''));
     return rows;
   };
-  // A small pool: PARALLEL workers each take the next batch as they finish the last.
-  const results = new Array(batches.length);
-  let next = 0;
-  const worker = async () => {
-    while (next < batches.length) { const i = next++; results[i] = await one(batches[i]); }
-  };
-  await Promise.all(Array.from({ length: Math.min(PARALLEL, batches.length) }, worker));
-  return results.flat();
+  return (await Promise.all(batches.map(one))).flat();
 }
 
 const modelChain = () => [MODEL, ...FALLBACKS.filter(m => m !== MODEL)];
@@ -1304,15 +1272,6 @@ async function callProxy(batch, model, base) {
   });
   if (!r.ok) throw new Error(r.status + ': ' + (await r.text()).slice(0, 300));
   const j = await r.json();
-  // Where a batch's time went, from the Worker: the model's own working time against the whole
-  // round trip. A large gap between them is time spent queued at Ollama, not time reading.
-  if (j.ollamaTiming) {
-    const t = j.ollamaTiming;
-    console.log(`[kartz] ${model}: ${t.images} images — ${t.wall}s round trip, model worked `
-      + `${t.model}s (read ${t.read}s, write ${t.write}s, load ${t.load}s), `
-      + `queued ≈${Math.max(0, Math.round((t.wall - t.model) * 10) / 10)}s; `
-      + `${t.promptTokens} tokens in, ${t.outputTokens} out`);
-  }
   // What it actually cost, as reported rather than guessed — the gate above is working from an
   // estimate, and an estimate that drifts low would walk the run straight back into a 429.
   if (j.usageMetadata) {
@@ -1465,22 +1424,13 @@ $('go').onclick = async () => {
     aliases = store.get('aliases') || {};
 
     log('decoding video…'); setProg(0);
-    const t0 = performance.now();
-    const frames = await extractFrames(videoFile, FRAMES,
+    const frames = await extractFrames(videoFile, +$('sens').value,
       (p, n) => { setProg(p * 0.5); log(`sampling video — ${n} frames kept`); });
     if (!frames.length) throw new Error('no frames captured');
     $('strip').innerHTML = frames.slice(0, 24)
       .map(f => `<img src="data:image/jpeg;base64,${f}">`).join('');
     log(`${frames.length} frames (${(frames.join('').length * 0.75 / 1024 | 0)} KB) — sending…`);
-    const t1 = performance.now();
     let sightings = await callModel(frames);
-    const t2 = performance.now();
-    // Where the time went, so a slow run can be pinned on the phone or on the model.
-    const timing = `sampling ${((t1 - t0) / 1000).toFixed(1)}s, model ${((t2 - t1) / 1000).toFixed(1)}s`
-      + ` — ${MODEL}, ${FRAMES} frames × ${STRIPS} strips, `
-      + `${Math.ceil(frames.length / batchSize(frames.length))} requests, ${PARALLEL} at a time`
-      + ($('sheetimg').checked ? '' : ', no roster picture');
-    console.log('[kartz] ' + timing);
     const frameCount = frames.length;
     // A roster_name the model returned is only worth anything if it is genuinely in the
     // roster; models will occasionally produce a plausible-looking name that is not on the
@@ -1585,17 +1535,14 @@ $('go').onclick = async () => {
       if (r.rank > n) n = r.rank;
     }
     render(roster);
-    log(`done — ${sightings.length} readings → ${rows.length} players  (${timing})`);
+    log(`done — ${sightings.length} readings → ${rows.length} players`);
     setProg(1);
   } catch (e) {
     const m = e.message;
     log(/\b429\b/.test(m) && /quota|per day/i.test(m)
-      ? (IS_OLLAMA
-          ? '✗ Ollama Cloud usage limit reached. Wait for the limit to reset, '
-            + 'or check the plan on your ollama.com account.'
-          : '✗ Daily free-tier quota used up (Gemini allows 500 requests a day). Each run costs '
-            + Math.ceil(FRAMES * STRIPS / batchSize(FRAMES * STRIPS)) + ' of them. Wait for the reset, '
-            + 'or enable billing on the key.')
+      ? '✗ Daily free-tier quota used up (Gemini allows 20 requests a day). Each run costs '
+        + Math.ceil(+$('sens').value * STRIPS / batchSize(+$('sens').value * STRIPS)) + ' of them. Wait for the reset, '
+        + 'or enable billing on the key.'
       : '✗ ' + m);
   }
   $('go').disabled = false;
